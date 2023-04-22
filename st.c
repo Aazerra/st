@@ -20,6 +20,8 @@
 #include "st.h"
 #include "win.h"
 
+extern char *argv0;
+
 #if   defined(__linux)
  #include <pty.h>
 #elif defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
@@ -162,6 +164,7 @@ typedef struct {
 } STREscape;
 
 static void execsh(char *, char **);
+static int chdir_by_pid(pid_t pid);
 static void stty(char **);
 static void sigchld(int);
 static void ttywriteraw(const char *, size_t);
@@ -225,6 +228,8 @@ static char *base64dec(const char *);
 static char base64dec_getc(const char **);
 
 static ssize_t xwrite(int, const char *, size_t);
+
+static int gettmuxpts(void);
 
 /* Globals */
 static Term term;
@@ -831,6 +836,7 @@ ttynew(const char *line, char *cmd, const char *out, char **args)
 		if (pledge("stdio rpath tty proc", NULL) == -1)
 			die("pledge\n");
 #endif
+		fcntl(m, F_SETFD, FD_CLOEXEC);
 		close(s);
 		cmdfd = m;
 		signal(SIGCHLD, sigchld);
@@ -1080,6 +1086,119 @@ tswapscreen(void)
 	term.alt = tmp;
 	term.mode ^= MODE_ALTSCREEN;
 	tfulldirt();
+}
+
+void
+newterm(const Arg* a)
+{
+	int pts;
+	FILE *fsession, *fpid;
+	char session[5];
+	char pidstr[10];
+	char buf[48];
+	size_t size;
+	switch (fork()) {
+	case -1:
+		die("fork failed: %s\n", strerror(errno));
+		break;
+	case 0:
+		switch (fork()) {
+		case -1:
+			fprintf(stderr, "fork failed: %s\n", strerror(errno));
+			_exit(1);
+			break;
+		case 0:
+			signal(SIGCHLD, SIG_DFL); /* pclose() needs to use wait() */
+			pts = gettmuxpts();
+			if (pts != -1) {
+				snprintf(buf, sizeof buf, "tmux lsc -t /dev/pts/%d -F \"#{client_session}\"", pts);
+				fsession = popen(buf, "r");
+				if (!fsession) {
+					fprintf(stderr, "Couldn't launch tmux.");
+					_exit(1);
+				}
+				size = fread(session, 1, sizeof session, fsession);
+				if (pclose(fsession) != 0 || size == 0) {
+					fprintf(stderr, "Couldn't get tmux session.");
+					_exit(1);
+				}
+				session[size - 1] = '\0'; /* size - 1 is used to also trim the \n */
+
+				snprintf(buf, sizeof buf, "tmux list-panes -st %s -F \"#{pane_pid}\"", session);
+				fpid = popen(buf, "r");
+				if (!fpid) {
+					fprintf(stderr, "Couldn't launch tmux.");
+					_exit(1);
+				}
+				size = fread(pidstr, 1, sizeof pidstr, fpid);
+				if (pclose(fpid) != 0 || size == 0) {
+					fprintf(stderr, "Couldn't get tmux session.");
+					_exit(1);
+				}
+				pidstr[size - 1] = '\0';
+			}
+
+			chdir_by_pid(pts != -1 ? atol(pidstr) : pid);
+			execl("/proc/self/exe", argv0, NULL);
+			_exit(1);
+			break;
+		default:
+			_exit(0);
+		}
+	default:
+		wait(NULL);
+	}
+}
+
+static int
+chdir_by_pid(pid_t pid)
+{
+	char buf[32];
+	snprintf(buf, sizeof buf, "/proc/%ld/cwd", (long)pid);
+	return chdir(buf);
+}
+
+/* returns the pty of tmux client or -1 if the child of st isn't tmux */
+static int
+gettmuxpts(void)
+{
+	char buf[32];
+	char comm[17];
+	int tty;
+	FILE *fstat;
+	FILE *fcomm;
+	size_t numread;
+
+	snprintf(buf, sizeof buf, "/proc/%ld/comm", (long)pid);
+
+	fcomm = fopen(buf, "r");
+	if (!fcomm) {
+		fprintf(stderr, "Couldn't open %s: %s\n", buf, strerror(errno));
+		_exit(1);
+	}
+
+	numread = fread(comm, 1, sizeof comm - 1, fcomm);
+	comm[numread] = '\0';
+
+	fclose(fcomm);
+
+	if (strcmp("tmux: client\n", comm) != 0)
+		return -1;
+
+	snprintf(buf, sizeof buf, "/proc/%ld/stat", (long)pid);
+	fstat = fopen(buf, "r");
+	if (!fstat) {
+		fprintf(stderr, "Couldn't open %s: %s\n", buf, strerror(errno));
+		_exit(1);
+	}
+
+	/*
+	 * We can't skip the second field with %*s because it contains a space so
+	 * we skip strlen("tmux: client") + 2 for the braces which is 14.
+	 */
+	fscanf(fstat, "%*d %*14c %*c %*d %*d %*d %d", &tty);
+	fclose(fstat);
+	return ((0xfff00000 & tty) >> 12) | (0xff & tty);
 }
 
 void
